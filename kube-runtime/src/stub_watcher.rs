@@ -1,4 +1,4 @@
-use futures::{FutureExt, StreamExt};
+use futures::StreamExt;
 use kube_client::{
     Resource,
     api::{ListParams, ObjectList, TypeMeta, WatchEvent, WatchParams},
@@ -6,9 +6,10 @@ use kube_client::{
 use serde::de::DeserializeOwned;
 use std::{
     cell::{Ref, RefCell},
+    collections::VecDeque,
     fmt::Debug,
-    ops::DerefMut,
     pin::Pin,
+    task::ready,
 };
 
 use crate::watcher::ApiMode;
@@ -20,19 +21,19 @@ pub enum Recording {
 
 /// `TestMode` is the test-only "mock" implementation for [`ApiMode`].
 ///
-/// [`TestMode::fixture`] is the fixed list of values `TestMode` returns, removing
-/// one element per call and returning it once none are left.
-/// This enables us to simulate different list scenarios.
-///
-/// [`TestMode::watch_sequence`] is the fixed list of [`Sequence`]s `TestMode` returns. The
-/// behaviour, is similar to [`TestMode::fixture`] but it allows for simulating "waiting" periods,
-/// empty intermediary result and for returning a [`futures::stream::BoxStream`] implemented via [`TestStream`].
 pub struct TestMode<K>
 where
     K: Clone + Debug + DeserializeOwned + Send + 'static,
 {
-    list_sequence: RefCell<Vec<kube_client::Result<ObjectList<K>>>>,
-    watch_sequences: RefCell<Vec<Sequence<K>>>,
+    /// [`TestMode::list_sequence`] is the fixed list of values `TestMode` returns, removing
+    /// one element per call and returning it once none are left.
+    /// This enables us to simulate different list scenarios.
+    ///
+    list_sequence: RefCell<VecDeque<kube_client::Result<ObjectList<K>>>>,
+    /// [`TestMode::watch_sequences`] is the fixed list of [`Sequence`]s `TestMode` returns. The
+    /// behaviour, is similar to [`TestMode::list_sequence`] but it allows for simulating "waiting" periods,
+    /// empty intermediary result and for returning a [`futures::stream::BoxStream`] implemented via [`TestStream`].
+    watch_sequences: RefCell<VecDeque<Sequence<K>>>,
     recorder: RefCell<Vec<Recording>>,
 }
 
@@ -52,11 +53,9 @@ where
     /// Arguments are mut because we reverse the order internally because we pop off the end
     /// which means the first element to be returned would the last which would be unexpected.
     pub fn new(
-        mut fixture: Vec<kube_client::Result<ObjectList<K>>>,
-        mut watch_sequence: Vec<Sequence<K>>,
+        fixture: VecDeque<kube_client::Result<ObjectList<K>>>,
+        watch_sequence: VecDeque<Sequence<K>>,
     ) -> Self {
-        fixture.reverse();
-        watch_sequence.reverse();
         Self {
             list_sequence: RefCell::new(fixture),
             watch_sequences: RefCell::new(watch_sequence),
@@ -120,31 +119,35 @@ where
 pub enum SequenceStep<K> {
     /// Represents returning from a list of results until the inner list is empty, i.e., [`std::task::Poll::Ready`] with one [`kube_client::Result<WatchEvent<_>>`]
     /// for each call.
-    List(Vec<kube_client::Result<WatchEvent<K>>>),
+    List(VecDeque<kube_client::Result<WatchEvent<K>>>),
     /// Represents a "sleep"/wait behaviour to simulate a watch(er) not returning elements for a
     /// certain duration.
     Wait(std::time::Duration),
 }
 
 pub struct Sequence<K> {
-    inner: Vec<SequenceStep<K>>,
+    inner: VecDeque<SequenceStep<K>>,
 }
 
 impl<K> Sequence<K> {
-    pub fn new(steps: Vec<SequenceStep<K>>) -> Self {
+    pub fn new(steps: VecDeque<SequenceStep<K>>) -> Self {
         Self { inner: steps }
     }
 }
 
 impl<K> Default for Sequence<K> {
     fn default() -> Self {
-        Sequence { inner: vec![] }
+        Sequence {
+            inner: VecDeque::new(),
+        }
     }
 }
 
 /// Implements [`futures::stream::BoxStream`] via [`futures::Stream`] for internal use via [`TestMode::watch`]
 pub struct TestStream<K> {
     seq: RefCell<Sequence<K>>,
+    /// [`TestStream::waiting`] is an internal field to support a [`Sequence<K>`] with
+    /// any item being [`SequenceStep::Wait`]. Where the inner-most [`tokio::time::Sleep`]
     waiting: Option<Pin<Box<tokio::time::Sleep>>>,
 }
 
@@ -156,25 +159,36 @@ impl<K: Unpin> futures::Stream for TestStream<K> {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if let Some(inner_fut) = this.waiting.as_mut() {
-            if !matches!(inner_fut.poll_unpin(cx), std::task::Poll::Ready(())) {
-                return std::task::Poll::Pending;
+        // The loop is here for handling the Wait/sleep case ergonomically:
+        // Once we encounter a sleep we want to go back to polling it:
+        // If it is pending (`std::task::Pending`), the macro neatly yields back to the executor for us and the call to
+        // poll(cx) assumes the the sleep has registered its waker into our cx (context), therefore
+        // waking (polling) the stream at the appropriate moment again.
+        // If it is ready (`std::task:Read(())`) immeadiately we want to continue consuming the next
+        // item in our sequence
+        loop {
+            if let Some(sleep) = this.waiting.as_mut() {
+                ready!(sleep.as_mut().poll(cx));
+                this.waiting = None;
             }
-            this.waiting = None;
-        }
-        let mut seq = this.seq.borrow_mut();
-        match seq.inner.pop() {
-            Some(step) => match step {
-                SequenceStep::List(mut watch_events) => std::task::Poll::Ready(watch_events.pop()),
-                SequenceStep::Wait(duration) => {
-                    if this.waiting.is_some() {
-                        unreachable!("TestStream::waiting should be None when accessing inner, this is a bug")
+            let mut seq = this.seq.borrow_mut();
+            match seq.inner.pop_front() {
+                Some(step) => match step {
+                    SequenceStep::List(mut watch_events) => {
+                        return std::task::Poll::Ready(watch_events.pop_front());
                     }
-                    this.waiting = Some(Box::pin(tokio::time::sleep(duration)));
-                    std::task::Poll::Pending
-                }
-            },
-            None => std::task::Poll::Ready(None),
+                    SequenceStep::Wait(duration) => {
+                        if this.waiting.is_some() {
+                            unreachable!(
+                                "TestStream::waiting should be None when accessing inner, this is a bug"
+                            )
+                        }
+                        this.waiting = Some(Box::pin(tokio::time::sleep(duration)));
+                    }
+                },
+                None => return std::task::Poll::Ready(None), // terminate the stream because no
+                                                             // squence steps are left
+            }
         }
     }
 }
@@ -188,7 +202,7 @@ where
 
     async fn list(&self, lp: &ListParams) -> kube_client::Result<ObjectList<Self::Value>> {
         self.recorder.borrow_mut().push(Recording::List(lp.clone()));
-        match self.list_sequence.borrow_mut().pop() {
+        match self.list_sequence.borrow_mut().pop_front() {
             Some(next) => next,
             None => Ok(empty_list()),
         }
@@ -203,7 +217,7 @@ where
         self.recorder
             .borrow_mut()
             .push(Recording::Watch(wp.clone(), version.into()));
-        let seq = self.watch_sequences.borrow_mut().pop().unwrap_or_default();
+        let seq = self.watch_sequences.borrow_mut().pop_front().unwrap_or_default();
         // NOTE(juf): Currently we assume no sequences == empty
         // stream.
         Ok(TestStream {
