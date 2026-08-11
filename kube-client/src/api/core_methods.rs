@@ -587,7 +587,7 @@ where
     /// let lp = WatchParams::default()
     ///     .fields("metadata.name=my_job")
     ///     .timeout(20); // upper bound of how long we watch for
-    /// let mut stream = jobs.watch(&lp, "0").await?.boxed();
+    /// let mut stream = jobs.watch_metadata(&lp, "0").await?.boxed();
     /// while let Some(status) = stream.try_next().await? {
     ///     match status {
     ///         WatchEvent::Added(s) => println!("Added {}", s.metadata.name.unwrap()),
