@@ -34,6 +34,7 @@ where
     /// behaviour, is similar to [`TestMode::list_sequence`] but it allows for simulating "waiting" periods,
     /// empty intermediary result and for returning a [`futures::stream::BoxStream`] implemented via [`TestStream`].
     watch_sequences: RefCell<VecDeque<Sequence<K>>>,
+    /// Any observed request gets tracked here. See [`Recording`] for details.
     recorder: RefCell<Vec<Recording>>,
 }
 
@@ -50,14 +51,12 @@ impl<K> TestMode<K>
 where
     K: Clone + Debug + DeserializeOwned + Send,
 {
-    /// Arguments are mut because we reverse the order internally because we pop off the end
-    /// which means the first element to be returned would the last which would be unexpected.
     pub fn new(
-        fixture: VecDeque<kube_client::Result<ObjectList<K>>>,
+        list_sequence: VecDeque<kube_client::Result<ObjectList<K>>>,
         watch_sequence: VecDeque<Sequence<K>>,
     ) -> Self {
         Self {
-            list_sequence: RefCell::new(fixture),
+            list_sequence: RefCell::new(list_sequence),
             watch_sequences: RefCell::new(watch_sequence),
             recorder: RefCell::new(vec![]),
         }
@@ -172,10 +171,15 @@ impl<K: Unpin> futures::Stream for TestStream<K> {
                 this.waiting = None;
             }
             let mut seq = this.seq.borrow_mut();
-            match seq.inner.pop_front() {
+            match seq.inner.front_mut() {
                 Some(step) => match step {
-                    SequenceStep::List(mut watch_events) => {
-                        return std::task::Poll::Ready(watch_events.pop_front());
+                    SequenceStep::List(watch_events) => {
+                        let e = watch_events.pop_front();
+                        if watch_events.len() == 0 {
+                            // Remove empty SequenceStep from steps VecDeque
+                            seq.inner.pop_front();
+                        }
+                        return std::task::Poll::Ready(e);
                     }
                     SequenceStep::Wait(duration) => {
                         if this.waiting.is_some() {
@@ -183,11 +187,13 @@ impl<K: Unpin> futures::Stream for TestStream<K> {
                                 "TestStream::waiting should be None when accessing inner, this is a bug"
                             )
                         }
-                        this.waiting = Some(Box::pin(tokio::time::sleep(duration)));
+                        this.waiting = Some(Box::pin(tokio::time::sleep(*duration)));
                     }
                 },
-                None => return std::task::Poll::Ready(None), // terminate the stream because no
-                                                             // squence steps are left
+                None => {
+                    return std::task::Poll::Ready(None);
+                } // terminate the stream because no
+                  // squence steps are left
             }
         }
     }

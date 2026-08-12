@@ -1057,10 +1057,13 @@ impl Backoff for DefaultBackoff {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{collections::BTreeMap, time::Duration};
 
     use k8s_openapi::{api::core::v1::ConfigMap, apimachinery::pkg::apis::meta::v1::ObjectMeta};
-    use kube_client::api::WatchEvent;
+    use kube_client::{
+        api::{TypeMeta, WatchEvent},
+        core::watch::{Bookmark, BookmarkMeta},
+    };
 
     use crate::watcher::{
         Config, ExponentialBackoff, State, WatchPhase, next_with_idle_timeout, step,
@@ -1077,6 +1080,107 @@ mod tests {
                 ..ObjectMeta::default()
             },
             ..ConfigMap::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn streaming_list_init() {
+        let api = TestMode::new(
+            vec![].into(),
+            vec![Sequence::new(
+                vec![
+                    SequenceStep::List(
+                        vec![
+                            Ok(WatchEvent::Added(config_map("a", "4"))),
+                            Ok(WatchEvent::Added(config_map("b", "3"))),
+                            Ok(WatchEvent::Added(config_map("c", "8"))),
+                            // Details here: https://kubernetes.io/docs/reference/using-api/api-concepts/#streaming-lists
+                            // Should only be sent when requested via allowWatchBookmarks=true
+                            // Since TestMode does not contain any real logic and  is not dynamically
+                            // progammable, this is up to the test
+                            // author to return or not for now.
+                            Ok(WatchEvent::Bookmark(Bookmark {
+                                types: TypeMeta::resource::<ConfigMap>(),
+                                metadata: BookmarkMeta {
+                                    resource_version: "145".to_string(),
+                                    annotations: BTreeMap::from_iter(vec![(
+                                        "k8s.io/initial-events-end".into(),
+                                        "true".into(),
+                                    )]),
+                                },
+                            })),
+                        ]
+                        .into(),
+                    ),
+                    //SequenceStep::Wait(Duration::from_millis(50)),
+                    SequenceStep::List(
+                        vec![
+                            Ok(WatchEvent::Modified(config_map("a", "5"))),
+                            Ok(WatchEvent::Deleted(config_map("b", "3"))),
+                            Ok(WatchEvent::Modified(config_map("c", "9"))),
+                        ]
+                        .into(),
+                    ),
+                ]
+                .into(),
+            )]
+            .into(),
+        );
+
+        let config = Config::default()
+            .timeout(1)
+            .streaming_lists()
+            .labels("app=test")
+            .fields("metadata.name!=ignored");
+        let mut state = State::default();
+        let (event, next) = step(&api, &config, state).await;
+        state = next;
+        assert_eq!(event.unwrap().to_string(), "InitApply(a)");
+
+        let (event, next) = step(&api, &config, state).await;
+        state = next;
+        assert_eq!(event.unwrap().to_string(), "InitApply(a)");
+
+        let (event, next) = step(&api, &config, state).await;
+        state = next;
+        assert_eq!(event.unwrap().to_string(), "InitApply(b)");
+
+        let (event, next) = step(&api, &config, state).await;
+        state = next;
+        assert_eq!(event.unwrap().to_string(), "InitApply(c)");
+
+        let (event, next) = step(&api, &config, state).await;
+        state = next;
+        assert_eq!(event.unwrap().to_string(), "InitDone");
+
+        let (event, _) = step(&api, &config, state).await;
+        assert_eq!(event.unwrap().to_string(), "Apply(d)");
+
+        let records = api.get_recordings();
+        match &records[..] {
+            [
+                Recording::List(first),
+                Recording::List(second),
+                Recording::List(third),
+                Recording::Watch(watch_params, watch_version),
+            ] => {
+                assert_eq!(first.continue_token.as_deref(), None);
+                assert_eq!(second.continue_token.as_deref(), Some("first"));
+                assert_eq!(third.continue_token.as_deref(), Some("second"));
+
+                assert_eq!(first.limit, Some(1));
+                assert_eq!(first.label_selector.as_deref(), Some("app=test"));
+                assert_eq!(first.field_selector.as_deref(), Some("metadata.name!=ignored"));
+
+                assert_eq!(watch_version, "3");
+                assert_eq!(watch_params.label_selector.as_deref(), Some("app=test"));
+                assert_eq!(
+                    watch_params.field_selector.as_deref(),
+                    Some("metadata.name!=ignored")
+                );
+                assert!(!watch_params.send_initial_events);
+            }
+            _ => panic!("unexpected API call sequence"),
         }
     }
 
