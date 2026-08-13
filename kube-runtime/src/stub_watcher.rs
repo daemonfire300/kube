@@ -14,6 +14,13 @@ use std::{
 
 use crate::watcher::ApiMode;
 
+fn exhausted_watch_sequence() -> kube_client::Error {
+    kube_client::Error::ReadEvents(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "TestMode watch sequence exhausted",
+    ))
+}
+
 pub enum Recording {
     List(ListParams),
     Watch(WatchParams, String),
@@ -30,9 +37,9 @@ where
     /// This enables us to simulate different list scenarios.
     ///
     list_sequence: RefCell<VecDeque<kube_client::Result<ObjectList<K>>>>,
-    /// [`TestMode::watch_sequences`] is the fixed list of [`Sequence`]s `TestMode` returns. The
-    /// behaviour, is similar to [`TestMode::list_sequence`] but it allows for simulating "waiting" periods,
-    /// empty intermediary result and for returning a [`futures::stream::BoxStream`] implemented via [`TestStream`].
+    /// [`TestMode::watch_sequences`] is the fixed list of [`Sequence`]s `TestMode` returns. It
+    /// allows simulating waiting periods and empty intermediary results via [`TestStream`]. Once
+    /// exhausted, further watch calls return an unexpected EOF error.
     watch_sequences: RefCell<VecDeque<Sequence<K>>>,
     /// Any observed request gets tracked here. See [`Recording`] for details.
     recorder: RefCell<Vec<Recording>>,
@@ -174,12 +181,14 @@ impl<K: Unpin> futures::Stream for TestStream<K> {
             match seq.inner.front_mut() {
                 Some(step) => match step {
                     SequenceStep::List(watch_events) => {
-                        let e = watch_events.pop_front();
-                        if watch_events.len() == 0 {
+                        let event = watch_events.pop_front();
+                        if watch_events.is_empty() {
                             // Remove empty SequenceStep from steps VecDeque
                             seq.inner.pop_front();
                         }
-                        return std::task::Poll::Ready(e);
+                        if let Some(event) = event {
+                            return std::task::Poll::Ready(Some(event));
+                        }
                     }
                     SequenceStep::Wait(duration) => {
                         if this.waiting.is_some() {
@@ -187,13 +196,14 @@ impl<K: Unpin> futures::Stream for TestStream<K> {
                                 "TestStream::waiting should be None when accessing inner, this is a bug"
                             )
                         }
-                        this.waiting = Some(Box::pin(tokio::time::sleep(*duration)));
+                        let duration = *duration;
+                        seq.inner.pop_front();
+                        this.waiting = Some(Box::pin(tokio::time::sleep(duration)));
                     }
                 },
                 None => {
-                    return std::task::Poll::Ready(None);
-                } // terminate the stream because no
-                  // squence steps are left
+                    return std::task::Poll::Ready(Some(Err(exhausted_watch_sequence())));
+                }
             }
         }
     }
@@ -223,9 +233,9 @@ where
         self.recorder
             .borrow_mut()
             .push(Recording::Watch(wp.clone(), version.into()));
-        let seq = self.watch_sequences.borrow_mut().pop_front().unwrap_or_default();
-        // NOTE(juf): Currently we assume no sequences == empty
-        // stream.
+        let Some(seq) = self.watch_sequences.borrow_mut().pop_front() else {
+            return Err(exhausted_watch_sequence());
+        };
         Ok(TestStream {
             seq: RefCell::new(seq),
             waiting: None,

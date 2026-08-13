@@ -546,14 +546,11 @@ where
 {
     match state {
         State::Empty => match wc.initial_list_strategy {
-            InitialListStrategy::ListWatch => (
-                Some(Ok(Event::Init)),
-                State::InitPage {
-                    continue_token: None,
-                    objects: VecDeque::default(),
-                    last_bookmark: None,
-                },
-            ),
+            InitialListStrategy::ListWatch => (Some(Ok(Event::Init)), State::InitPage {
+                continue_token: None,
+                objects: VecDeque::default(),
+                last_bookmark: None,
+            }),
             InitialListStrategy::StreamingList => {
                 match api.watch(&wc.to_watch_params(WatchPhase::Initial), "0").await {
                     Ok(stream) => (None, State::InitialWatch { stream }),
@@ -574,14 +571,11 @@ where
             last_bookmark,
         } => {
             if let Some(next) = objects.pop_front() {
-                return (
-                    Some(Ok(Event::InitApply(next))),
-                    State::InitPage {
-                        continue_token,
-                        objects,
-                        last_bookmark,
-                    },
-                );
+                return (Some(Ok(Event::InitApply(next))), State::InitPage {
+                    continue_token,
+                    objects,
+                    last_bookmark,
+                });
             }
             // check if we need to perform more pages
             if continue_token.is_none()
@@ -601,14 +595,11 @@ where
                     }
                     // Buffer page here, causing us to return to this enum branch (State::InitPage)
                     // until the objects buffer has drained
-                    (
-                        None,
-                        State::InitPage {
-                            continue_token,
-                            objects: list.items.into_iter().collect(),
-                            last_bookmark,
-                        },
-                    )
+                    (None, State::InitPage {
+                        continue_token,
+                        objects: list.items.into_iter().collect(),
+                        last_bookmark,
+                    })
                 }
                 Err(err) => {
                     if std::matches!(err, ClientErr::Api(ref status) if status.is_forbidden()) {
@@ -634,13 +625,10 @@ where
                 Some(Ok(WatchEvent::Bookmark(bm))) => {
                     let marks_initial_end = bm.metadata.annotations.contains_key("k8s.io/initial-events-end");
                     if marks_initial_end {
-                        (
-                            Some(Ok(Event::InitDone)),
-                            State::Watching {
-                                resource_version: bm.metadata.resource_version,
-                                stream,
-                            },
-                        )
+                        (Some(Ok(Event::InitDone)), State::Watching {
+                            resource_version: bm.metadata.resource_version,
+                            stream,
+                        })
                     } else {
                         (None, State::InitialWatch { stream })
                     }
@@ -675,23 +663,19 @@ where
                 .watch(&wc.to_watch_params(WatchPhase::Resumed), &resource_version)
                 .await
             {
-                Ok(stream) => (
-                    None,
-                    State::Watching {
-                        resource_version,
-                        stream,
-                    },
-                ),
+                Ok(stream) => (None, State::Watching {
+                    resource_version,
+                    stream,
+                }),
                 Err(err) => {
                     if std::matches!(err, ClientErr::Api(ref status) if status.is_forbidden()) {
                         warn!("watch initlist error with 403: {err:?}");
                     } else {
                         debug!("watch initlist error: {err:?}");
                     }
-                    (
-                        Some(Err(Error::WatchStartFailed(err))),
-                        State::InitListed { resource_version },
-                    )
+                    (Some(Err(Error::WatchStartFailed(err))), State::InitListed {
+                        resource_version,
+                    })
                 }
             }
         }
@@ -704,13 +688,10 @@ where
                 if resource_version.is_empty() {
                     (Some(Err(Error::NoResourceVersion)), State::default())
                 } else {
-                    (
-                        Some(Ok(Event::Apply(obj))),
-                        State::Watching {
-                            resource_version,
-                            stream,
-                        },
-                    )
+                    (Some(Ok(Event::Apply(obj))), State::Watching {
+                        resource_version,
+                        stream,
+                    })
                 }
             }
             Some(Ok(WatchEvent::Deleted(obj))) => {
@@ -718,22 +699,16 @@ where
                 if resource_version.is_empty() {
                     (Some(Err(Error::NoResourceVersion)), State::default())
                 } else {
-                    (
-                        Some(Ok(Event::Delete(obj))),
-                        State::Watching {
-                            resource_version,
-                            stream,
-                        },
-                    )
+                    (Some(Ok(Event::Delete(obj))), State::Watching {
+                        resource_version,
+                        stream,
+                    })
                 }
             }
-            Some(Ok(WatchEvent::Bookmark(bm))) => (
-                None,
-                State::Watching {
-                    resource_version: bm.metadata.resource_version,
-                    stream,
-                },
-            ),
+            Some(Ok(WatchEvent::Bookmark(bm))) => (None, State::Watching {
+                resource_version: bm.metadata.resource_version,
+                stream,
+            }),
             Some(Ok(WatchEvent::Error(err))) => {
                 // HTTP GONE, means we have desynced and need to start over and re-list :(
                 let new_state = if err.code == 410 {
@@ -757,13 +732,10 @@ where
                 } else {
                     debug!("watcher error: {err:?}");
                 }
-                (
-                    Some(Err(Error::WatchFailed(err))),
-                    State::Watching {
-                        resource_version,
-                        stream,
-                    },
-                )
+                (Some(Err(Error::WatchFailed(err))), State::Watching {
+                    resource_version,
+                    stream,
+                })
             }
             None => (None, State::InitListed { resource_version }),
         },
@@ -1059,14 +1031,15 @@ impl Backoff for DefaultBackoff {
 mod tests {
     use std::{collections::BTreeMap, time::Duration};
 
+    use futures::StreamExt;
     use k8s_openapi::{api::core::v1::ConfigMap, apimachinery::pkg::apis::meta::v1::ObjectMeta};
     use kube_client::{
-        api::{TypeMeta, WatchEvent},
+        api::{TypeMeta, WatchEvent, WatchParams},
         core::watch::{Bookmark, BookmarkMeta},
     };
 
     use crate::watcher::{
-        Config, ExponentialBackoff, State, WatchPhase, next_with_idle_timeout, step,
+        ApiMode, Config, Error, ExponentialBackoff, State, WatchPhase, next_with_idle_timeout, step,
         stub_watcher::{Recording, Sequence, SequenceStep, TestMode},
     };
 
@@ -1081,6 +1054,32 @@ mod tests {
             },
             ..ConfigMap::default()
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn test_mode_watch_waits_before_returning_next_event() {
+        let api = TestMode::new(
+            vec![].into(),
+            vec![Sequence::new(
+                vec![
+                    SequenceStep::Wait(Duration::from_millis(50)),
+                    SequenceStep::List(vec![Ok(WatchEvent::Added(config_map("a", "1")))].into()),
+                ]
+                .into(),
+            )]
+            .into(),
+        );
+        let mut stream = api.watch(&WatchParams::default(), "0").await.unwrap();
+
+        assert!(futures::poll!(stream.next()).is_pending());
+        tokio::time::advance(Duration::from_millis(49)).await;
+        assert!(futures::poll!(stream.next()).is_pending());
+        tokio::time::advance(Duration::from_millis(1)).await;
+
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(WatchEvent::Added(config_map))) if config_map.metadata.name.as_deref() == Some("a")
+        ));
     }
 
     #[tokio::test]
@@ -1112,7 +1111,6 @@ mod tests {
                         ]
                         .into(),
                     ),
-                    //SequenceStep::Wait(Duration::from_millis(50)),
                     SequenceStep::List(
                         vec![
                             Ok(WatchEvent::Modified(config_map("a", "5"))),
@@ -1133,52 +1131,39 @@ mod tests {
             .labels("app=test")
             .fields("metadata.name!=ignored");
         let mut state = State::default();
-        let (event, next) = step(&api, &config, state).await;
-        state = next;
-        assert_eq!(event.unwrap().to_string(), "InitApply(a)");
+        for expected in [
+            "InitApply(a)",
+            "InitApply(b)",
+            "InitApply(c)",
+            "InitDone",
+            "Apply(a)",
+            "Delete(b)",
+            "Apply(c)",
+        ] {
+            let (event, next) = step(&api, &config, state).await;
+            state = next;
+            assert_eq!(event.unwrap().to_string(), expected);
+        }
 
-        let (event, next) = step(&api, &config, state).await;
-        state = next;
-        assert_eq!(event.unwrap().to_string(), "InitApply(a)");
-
-        let (event, next) = step(&api, &config, state).await;
-        state = next;
-        assert_eq!(event.unwrap().to_string(), "InitApply(b)");
-
-        let (event, next) = step(&api, &config, state).await;
-        state = next;
-        assert_eq!(event.unwrap().to_string(), "InitApply(c)");
-
-        let (event, next) = step(&api, &config, state).await;
-        state = next;
-        assert_eq!(event.unwrap().to_string(), "InitDone");
-
-        let (event, _) = step(&api, &config, state).await;
-        assert_eq!(event.unwrap().to_string(), "Apply(d)");
+        let (event, _) = tokio::time::timeout(Duration::from_millis(100), step(&api, &config, state))
+            .await
+            .expect("step should return when the TestMode sequence is exhausted");
+        assert!(matches!(
+            event,
+            Err(Error::WatchFailed(kube_client::Error::ReadEvents(err)))
+                if err.kind() == std::io::ErrorKind::UnexpectedEof
+        ));
 
         let records = api.get_recordings();
         match &records[..] {
-            [
-                Recording::List(first),
-                Recording::List(second),
-                Recording::List(third),
-                Recording::Watch(watch_params, watch_version),
-            ] => {
-                assert_eq!(first.continue_token.as_deref(), None);
-                assert_eq!(second.continue_token.as_deref(), Some("first"));
-                assert_eq!(third.continue_token.as_deref(), Some("second"));
-
-                assert_eq!(first.limit, Some(1));
-                assert_eq!(first.label_selector.as_deref(), Some("app=test"));
-                assert_eq!(first.field_selector.as_deref(), Some("metadata.name!=ignored"));
-
-                assert_eq!(watch_version, "3");
+            [Recording::Watch(watch_params, watch_version)] => {
+                assert_eq!(watch_version, "0");
                 assert_eq!(watch_params.label_selector.as_deref(), Some("app=test"));
                 assert_eq!(
                     watch_params.field_selector.as_deref(),
                     Some("metadata.name!=ignored")
                 );
-                assert!(!watch_params.send_initial_events);
+                assert!(watch_params.send_initial_events);
             }
             _ => panic!("unexpected API call sequence"),
         }
