@@ -14,11 +14,25 @@ use std::{
 
 use crate::watcher::ApiMode;
 
+const TEST_MODE_SEQUENCE_EXHAUSTED_DESC: &'static str = "TestMode watch sequence exhausted";
+
 fn exhausted_watch_sequence() -> kube_client::Error {
     kube_client::Error::ReadEvents(std::io::Error::new(
         std::io::ErrorKind::UnexpectedEof,
-        "TestMode watch sequence exhausted",
+        TEST_MODE_SEQUENCE_EXHAUSTED_DESC,
     ))
+}
+
+/// Helper method to check whether an error is a graceful exhaustion of the TestMode watch sequence
+/// exhaustion, i.e., no more elements are expected to be returned.
+/// This method expects an error, making it a bit less ergonomic on the caller. The alternative was
+/// using [`kube_client::Result`] with [`std::any::Any`] as event type.
+pub fn error_indicates_graceful_watch_seq_exhaustion(err: &crate::watcher::Error) -> bool {
+    matches!(
+        err,
+        crate::watcher::Error::WatchFailed(kube_client::Error::ReadEvents(err))
+            if err.kind() == std::io::ErrorKind::UnexpectedEof
+    ) && err.to_string().contains(TEST_MODE_SEQUENCE_EXHAUSTED_DESC)
 }
 
 pub enum Recording {

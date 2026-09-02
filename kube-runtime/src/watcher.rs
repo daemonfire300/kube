@@ -546,11 +546,14 @@ where
 {
     match state {
         State::Empty => match wc.initial_list_strategy {
-            InitialListStrategy::ListWatch => (Some(Ok(Event::Init)), State::InitPage {
-                continue_token: None,
-                objects: VecDeque::default(),
-                last_bookmark: None,
-            }),
+            InitialListStrategy::ListWatch => (
+                Some(Ok(Event::Init)),
+                State::InitPage {
+                    continue_token: None,
+                    objects: VecDeque::default(),
+                    last_bookmark: None,
+                },
+            ),
             InitialListStrategy::StreamingList => {
                 match api.watch(&wc.to_watch_params(WatchPhase::Initial), "0").await {
                     Ok(stream) => (None, State::InitialWatch { stream }),
@@ -571,11 +574,14 @@ where
             last_bookmark,
         } => {
             if let Some(next) = objects.pop_front() {
-                return (Some(Ok(Event::InitApply(next))), State::InitPage {
-                    continue_token,
-                    objects,
-                    last_bookmark,
-                });
+                return (
+                    Some(Ok(Event::InitApply(next))),
+                    State::InitPage {
+                        continue_token,
+                        objects,
+                        last_bookmark,
+                    },
+                );
             }
             // check if we need to perform more pages
             if continue_token.is_none()
@@ -595,11 +601,14 @@ where
                     }
                     // Buffer page here, causing us to return to this enum branch (State::InitPage)
                     // until the objects buffer has drained
-                    (None, State::InitPage {
-                        continue_token,
-                        objects: list.items.into_iter().collect(),
-                        last_bookmark,
-                    })
+                    (
+                        None,
+                        State::InitPage {
+                            continue_token,
+                            objects: list.items.into_iter().collect(),
+                            last_bookmark,
+                        },
+                    )
                 }
                 Err(err) => {
                     if std::matches!(err, ClientErr::Api(ref status) if status.is_forbidden()) {
@@ -625,10 +634,13 @@ where
                 Some(Ok(WatchEvent::Bookmark(bm))) => {
                     let marks_initial_end = bm.metadata.annotations.contains_key("k8s.io/initial-events-end");
                     if marks_initial_end {
-                        (Some(Ok(Event::InitDone)), State::Watching {
-                            resource_version: bm.metadata.resource_version,
-                            stream,
-                        })
+                        (
+                            Some(Ok(Event::InitDone)),
+                            State::Watching {
+                                resource_version: bm.metadata.resource_version,
+                                stream,
+                            },
+                        )
                     } else {
                         (None, State::InitialWatch { stream })
                     }
@@ -663,19 +675,23 @@ where
                 .watch(&wc.to_watch_params(WatchPhase::Resumed), &resource_version)
                 .await
             {
-                Ok(stream) => (None, State::Watching {
-                    resource_version,
-                    stream,
-                }),
+                Ok(stream) => (
+                    None,
+                    State::Watching {
+                        resource_version,
+                        stream,
+                    },
+                ),
                 Err(err) => {
                     if std::matches!(err, ClientErr::Api(ref status) if status.is_forbidden()) {
                         warn!("watch initlist error with 403: {err:?}");
                     } else {
                         debug!("watch initlist error: {err:?}");
                     }
-                    (Some(Err(Error::WatchStartFailed(err))), State::InitListed {
-                        resource_version,
-                    })
+                    (
+                        Some(Err(Error::WatchStartFailed(err))),
+                        State::InitListed { resource_version },
+                    )
                 }
             }
         }
@@ -688,10 +704,13 @@ where
                 if resource_version.is_empty() {
                     (Some(Err(Error::NoResourceVersion)), State::default())
                 } else {
-                    (Some(Ok(Event::Apply(obj))), State::Watching {
-                        resource_version,
-                        stream,
-                    })
+                    (
+                        Some(Ok(Event::Apply(obj))),
+                        State::Watching {
+                            resource_version,
+                            stream,
+                        },
+                    )
                 }
             }
             Some(Ok(WatchEvent::Deleted(obj))) => {
@@ -699,16 +718,22 @@ where
                 if resource_version.is_empty() {
                     (Some(Err(Error::NoResourceVersion)), State::default())
                 } else {
-                    (Some(Ok(Event::Delete(obj))), State::Watching {
-                        resource_version,
-                        stream,
-                    })
+                    (
+                        Some(Ok(Event::Delete(obj))),
+                        State::Watching {
+                            resource_version,
+                            stream,
+                        },
+                    )
                 }
             }
-            Some(Ok(WatchEvent::Bookmark(bm))) => (None, State::Watching {
-                resource_version: bm.metadata.resource_version,
-                stream,
-            }),
+            Some(Ok(WatchEvent::Bookmark(bm))) => (
+                None,
+                State::Watching {
+                    resource_version: bm.metadata.resource_version,
+                    stream,
+                },
+            ),
             Some(Ok(WatchEvent::Error(err))) => {
                 // HTTP GONE, means we have desynced and need to start over and re-list :(
                 let new_state = if err.code == 410 {
@@ -732,10 +757,13 @@ where
                 } else {
                     debug!("watcher error: {err:?}");
                 }
-                (Some(Err(Error::WatchFailed(err))), State::Watching {
-                    resource_version,
-                    stream,
-                })
+                (
+                    Some(Err(Error::WatchFailed(err))),
+                    State::Watching {
+                        resource_version,
+                        stream,
+                    },
+                )
             }
             None => (None, State::InitListed { resource_version }),
         },
@@ -1040,7 +1068,9 @@ mod tests {
 
     use crate::watcher::{
         ApiMode, Config, Error, ExponentialBackoff, State, WatchPhase, next_with_idle_timeout, step,
-        stub_watcher::{Recording, Sequence, SequenceStep, TestMode},
+        stub_watcher::{
+            Recording, Sequence, SequenceStep, TestMode, error_indicates_graceful_watch_seq_exhaustion,
+        },
     };
 
     use super::stub_watcher::ResultPage;
@@ -1148,11 +1178,10 @@ mod tests {
         let (event, _) = tokio::time::timeout(Duration::from_millis(100), step(&api, &config, state))
             .await
             .expect("step should return when the TestMode sequence is exhausted");
-        assert!(matches!(
-            event,
-            Err(Error::WatchFailed(kube_client::Error::ReadEvents(err)))
-                if err.kind() == std::io::ErrorKind::UnexpectedEof
-        ));
+        // See function docs for more context, we expect this error, when we want to check whether
+        // the whole watch sequence has been consumed and as breaker to avoid consuming an infinite
+        // async stream that returns None.
+        assert!(event.is_err_and(|err| error_indicates_graceful_watch_seq_exhaustion(&err)));
 
         let records = api.get_recordings();
         match &records[..] {
