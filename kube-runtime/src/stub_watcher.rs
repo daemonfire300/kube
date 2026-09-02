@@ -14,7 +14,7 @@ use std::{
 
 use crate::watcher::ApiMode;
 
-const TEST_MODE_SEQUENCE_EXHAUSTED_DESC: &'static str = "TestMode watch sequence exhausted";
+const TEST_MODE_SEQUENCE_EXHAUSTED_DESC: &str = "TestMode watch sequence exhausted";
 
 fn exhausted_watch_sequence() -> kube_client::Error {
     kube_client::Error::ReadEvents(std::io::Error::new(
@@ -23,7 +23,7 @@ fn exhausted_watch_sequence() -> kube_client::Error {
     ))
 }
 
-/// Helper method to check whether an error is a graceful exhaustion of the TestMode watch sequence
+/// Helper method to check whether an error is a graceful exhaustion of the [`TestMode`] watch sequence
 /// exhaustion, i.e., no more elements are expected to be returned.
 /// This method expects an error, making it a bit less ergonomic on the caller. The alternative was
 /// using [`kube_client::Result`] with [`std::any::Any`] as event type.
