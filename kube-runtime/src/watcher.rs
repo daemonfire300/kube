@@ -173,8 +173,8 @@ enum State<K> {
 
 /// Used to control whether the watcher receives the full object, or only the
 /// metadata
-trait ApiMode {
-    type Value: Clone;
+trait ApiMode: Send + Sync {
+    type Value: Clone + Send;
 
     async fn list(&self, lp: &ListParams) -> kube_client::Result<ObjectList<Self::Value>>;
     async fn watch(
@@ -546,11 +546,14 @@ where
 {
     match state {
         State::Empty => match wc.initial_list_strategy {
-            InitialListStrategy::ListWatch => (Some(Ok(Event::Init)), State::InitPage {
-                continue_token: None,
-                objects: VecDeque::default(),
-                last_bookmark: None,
-            }),
+            InitialListStrategy::ListWatch => (
+                Some(Ok(Event::Init)),
+                State::InitPage {
+                    continue_token: None,
+                    objects: VecDeque::default(),
+                    last_bookmark: None,
+                },
+            ),
             InitialListStrategy::StreamingList => {
                 match api.watch(&wc.to_watch_params(WatchPhase::Initial), "0").await {
                     Ok(stream) => (None, State::InitialWatch { stream }),
@@ -571,11 +574,14 @@ where
             last_bookmark,
         } => {
             if let Some(next) = objects.pop_front() {
-                return (Some(Ok(Event::InitApply(next))), State::InitPage {
-                    continue_token,
-                    objects,
-                    last_bookmark,
-                });
+                return (
+                    Some(Ok(Event::InitApply(next))),
+                    State::InitPage {
+                        continue_token,
+                        objects,
+                        last_bookmark,
+                    },
+                );
             }
             // check if we need to perform more pages
             if continue_token.is_none()
@@ -595,11 +601,14 @@ where
                     }
                     // Buffer page here, causing us to return to this enum branch (State::InitPage)
                     // until the objects buffer has drained
-                    (None, State::InitPage {
-                        continue_token,
-                        objects: list.items.into_iter().collect(),
-                        last_bookmark,
-                    })
+                    (
+                        None,
+                        State::InitPage {
+                            continue_token,
+                            objects: list.items.into_iter().collect(),
+                            last_bookmark,
+                        },
+                    )
                 }
                 Err(err) => {
                     if std::matches!(err, ClientErr::Api(ref status) if status.is_forbidden()) {
@@ -625,10 +634,13 @@ where
                 Some(Ok(WatchEvent::Bookmark(bm))) => {
                     let marks_initial_end = bm.metadata.annotations.contains_key("k8s.io/initial-events-end");
                     if marks_initial_end {
-                        (Some(Ok(Event::InitDone)), State::Watching {
-                            resource_version: bm.metadata.resource_version,
-                            stream,
-                        })
+                        (
+                            Some(Ok(Event::InitDone)),
+                            State::Watching {
+                                resource_version: bm.metadata.resource_version,
+                                stream,
+                            },
+                        )
                     } else {
                         (None, State::InitialWatch { stream })
                     }
@@ -663,19 +675,23 @@ where
                 .watch(&wc.to_watch_params(WatchPhase::Resumed), &resource_version)
                 .await
             {
-                Ok(stream) => (None, State::Watching {
-                    resource_version,
-                    stream,
-                }),
+                Ok(stream) => (
+                    None,
+                    State::Watching {
+                        resource_version,
+                        stream,
+                    },
+                ),
                 Err(err) => {
                     if std::matches!(err, ClientErr::Api(ref status) if status.is_forbidden()) {
                         warn!("watch initlist error with 403: {err:?}");
                     } else {
                         debug!("watch initlist error: {err:?}");
                     }
-                    (Some(Err(Error::WatchStartFailed(err))), State::InitListed {
-                        resource_version,
-                    })
+                    (
+                        Some(Err(Error::WatchStartFailed(err))),
+                        State::InitListed { resource_version },
+                    )
                 }
             }
         }
@@ -688,10 +704,13 @@ where
                 if resource_version.is_empty() {
                     (Some(Err(Error::NoResourceVersion)), State::default())
                 } else {
-                    (Some(Ok(Event::Apply(obj))), State::Watching {
-                        resource_version,
-                        stream,
-                    })
+                    (
+                        Some(Ok(Event::Apply(obj))),
+                        State::Watching {
+                            resource_version,
+                            stream,
+                        },
+                    )
                 }
             }
             Some(Ok(WatchEvent::Deleted(obj))) => {
@@ -699,16 +718,22 @@ where
                 if resource_version.is_empty() {
                     (Some(Err(Error::NoResourceVersion)), State::default())
                 } else {
-                    (Some(Ok(Event::Delete(obj))), State::Watching {
-                        resource_version,
-                        stream,
-                    })
+                    (
+                        Some(Ok(Event::Delete(obj))),
+                        State::Watching {
+                            resource_version,
+                            stream,
+                        },
+                    )
                 }
             }
-            Some(Ok(WatchEvent::Bookmark(bm))) => (None, State::Watching {
-                resource_version: bm.metadata.resource_version,
-                stream,
-            }),
+            Some(Ok(WatchEvent::Bookmark(bm))) => (
+                None,
+                State::Watching {
+                    resource_version: bm.metadata.resource_version,
+                    stream,
+                },
+            ),
             Some(Ok(WatchEvent::Error(err))) => {
                 // HTTP GONE, means we have desynced and need to start over and re-list :(
                 let new_state = if err.code == 410 {
@@ -732,10 +757,13 @@ where
                 } else {
                     debug!("watcher error: {err:?}");
                 }
-                (Some(Err(Error::WatchFailed(err))), State::Watching {
-                    resource_version,
-                    stream,
-                })
+                (
+                    Some(Err(Error::WatchFailed(err))),
+                    State::Watching {
+                        resource_version,
+                        stream,
+                    },
+                )
             }
             None => (None, State::InitListed { resource_version }),
         },
@@ -822,6 +850,23 @@ pub fn watcher<K: Resource + Clone + DeserializeOwned + Debug + Send + 'static>(
         },
     )
 }
+
+//pub fn recoverable_watcher<A>(
+//    api: A,
+//    watcher_config: Config,
+//) -> impl Stream<Item = Result<Event<A::Value>>> + Send
+//where
+//    A: ApiMode + Send + Sync,
+//    A::Value: Resource + Clone + DeserializeOwned + Debug + Send + Sync + 'static,
+//{
+//    futures::stream::unfold(
+//        (api, watcher_config, State::default()),
+//        |(api, watcher_config, state)| async {
+//            let (event, state) = step(&api, &watcher_config, state).await;
+//            Some((event, (api, watcher_config, state)))
+//        },
+//    )
+//}
 
 /// Watches a Kubernetes Resource for changes continuously and receives only the
 /// metadata
@@ -1039,7 +1084,7 @@ mod tests {
     };
 
     use crate::watcher::{
-        ApiMode, Config, Error, ExponentialBackoff, State, WatchPhase, next_with_idle_timeout, step,
+        self, ApiMode, Config, Error, ExponentialBackoff, State, WatchPhase, next_with_idle_timeout, step,
         stub_watcher::{
             Recording, Sequence, SequenceStep, TestMode, error_indicates_graceful_watch_seq_exhaustion,
         },
@@ -1085,6 +1130,126 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn streaming_list_resync() {
+        // The purpose of this test specifically is to test the recovery behaviour of
+        // step/step_trampolined, i.e., it should continue producing/processing results even after
+        // the underlying ApiMode returns a temporary/recoverable error.
+        // TODO(juf): Consider/think about: calling watcher(...) instead to include it in the code/test-coverage
+        // as well.
+
+        const LAST_VALID_RESOURCE_VERSION: &str = "5";
+        let api = TestMode::new(
+            vec![].into(),
+            vec![Sequence::new(
+                vec![
+                    SequenceStep::List(
+                        vec![
+                            Ok(WatchEvent::Added(config_map("a", "2"))),
+                            Ok(WatchEvent::Added(config_map("b", "3"))),
+                            Ok(WatchEvent::Added(config_map("c", "4"))),
+                            // Details here: https://kubernetes.io/docs/reference/using-api/api-concepts/#streaming-lists
+                            // Should only be sent when requested via allowWatchBookmarks=true
+                            // Since TestMode does not contain any real logic and  is not dynamically
+                            // progammable, this is up to the test
+                            // author to return or not for now.
+                            Ok(WatchEvent::Bookmark(Bookmark {
+                                types: TypeMeta::resource::<ConfigMap>(),
+                                metadata: BookmarkMeta {
+                                    resource_version: "4".to_string(),
+                                    annotations: BTreeMap::from_iter(vec![(
+                                        "k8s.io/initial-events-end".into(),
+                                        "true".into(),
+                                    )]),
+                                },
+                            })),
+                        ]
+                        .into(),
+                    ),
+                    SequenceStep::List(
+                        vec![
+                            Ok(WatchEvent::Modified(config_map("a", LAST_VALID_RESOURCE_VERSION))),
+                            Err(kube_client::Error::ReadEvents(std::io::Error::new(
+                                std::io::ErrorKind::UnexpectedEof,
+                                "A recoverable error occured",
+                            ))),
+                        ]
+                        .into(),
+                    ),
+                    // After an error we expect the watcher to request its last(latest) known
+                    // resource version to be queried again.
+                    SequenceStep::List(
+                        vec![Ok(WatchEvent::Modified(config_map(
+                            "a",
+                            LAST_VALID_RESOURCE_VERSION,
+                        )))]
+                        .into(),
+                    ),
+                ]
+                .into(),
+            )]
+            .into(),
+        );
+
+        let config = Config::default()
+            .timeout(1)
+            .streaming_lists()
+            .labels("app=test")
+            .fields("metadata.name!=ignored");
+        //let test_watcher = super::watcher(api, config);
+        let mut state = State::default();
+        for expected in [
+            "InitApply(a)",
+            "InitApply(b)",
+            "InitApply(c)",
+            "InitDone",
+            "Apply(a)",
+            "watch stream failed: Error reading events stream: A recoverable error occured",
+            "Apply(a)",
+        ] {
+            println!("-----");
+            dbg!(&state);
+            println!(">>>");
+            let (event, next) = step(&api, &config, state).await;
+            state = next;
+            let repr = match event {
+                Ok(event) => {
+                    println!("Ok()");
+                    event.to_string()
+                }
+                Err(err) => {
+                    println!("Err()");
+                    err.to_string()
+                }
+            };
+            dbg!(&state);
+            println!("-----");
+            assert_eq!(repr, expected);
+        }
+
+        let (event, _) = tokio::time::timeout(Duration::from_millis(100), step(&api, &config, state))
+            .await
+            .expect("step should return when the TestMode sequence is exhausted");
+        // See function docs for more context, we expect this error, when we want to check whether
+        // the whole watch sequence has been consumed and as breaker to avoid consuming an infinite
+        // async stream that returns None.
+        assert!(event.is_err_and(|err| error_indicates_graceful_watch_seq_exhaustion(&err)));
+
+        let records = api.get_recordings();
+        match &records[..] {
+            [Recording::Watch(watch_params, watch_version)] => {
+                assert_eq!(watch_version, "0");
+                assert_eq!(watch_params.label_selector.as_deref(), Some("app=test"));
+                assert_eq!(
+                    watch_params.field_selector.as_deref(),
+                    Some("metadata.name!=ignored")
+                );
+                assert!(watch_params.send_initial_events);
+            }
+            _ => panic!("unexpected API call sequence"),
+        }
+    }
+
+    #[tokio::test]
     async fn streaming_list_init() {
         let api = TestMode::new(
             vec![].into(),
@@ -1092,9 +1257,9 @@ mod tests {
                 vec![
                     SequenceStep::List(
                         vec![
-                            Ok(WatchEvent::Added(config_map("a", "4"))),
+                            Ok(WatchEvent::Added(config_map("a", "2"))),
                             Ok(WatchEvent::Added(config_map("b", "3"))),
-                            Ok(WatchEvent::Added(config_map("c", "8"))),
+                            Ok(WatchEvent::Added(config_map("c", "4"))),
                             // Details here: https://kubernetes.io/docs/reference/using-api/api-concepts/#streaming-lists
                             // Should only be sent when requested via allowWatchBookmarks=true
                             // Since TestMode does not contain any real logic and  is not dynamically
@@ -1116,7 +1281,7 @@ mod tests {
                     SequenceStep::List(
                         vec![
                             Ok(WatchEvent::Modified(config_map("a", "5"))),
-                            Ok(WatchEvent::Deleted(config_map("b", "3"))),
+                            Ok(WatchEvent::Deleted(config_map("b", "7"))),
                             Ok(WatchEvent::Modified(config_map("c", "9"))),
                         ]
                         .into(),

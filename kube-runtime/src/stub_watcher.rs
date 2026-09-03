@@ -44,7 +44,7 @@ pub enum Recording {
 ///
 pub struct TestMode<K>
 where
-    K: Clone + Debug + DeserializeOwned + Send + 'static,
+    K: Clone + Debug + DeserializeOwned + Send + Sync + 'static,
 {
     /// [`TestMode::list_sequence`] is the fixed list of values `TestMode` returns, removing
     /// one element per call and returning it once none are left.
@@ -61,7 +61,7 @@ where
 
 impl<K> TestMode<K>
 where
-    K: Clone + Debug + DeserializeOwned + Send,
+    K: Clone + Debug + DeserializeOwned + Send + Sync,
 {
     pub fn get_recordings(&self) -> Ref<'_, Vec<Recording>> {
         self.recorder.borrow()
