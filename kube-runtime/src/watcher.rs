@@ -1356,16 +1356,27 @@ mod tests {
 
         let records = api.get_recordings();
         match &records[..] {
-            [Recording::Watch(watch_params, watch_version)] => {
-                assert_eq!(watch_version, "0");
-                assert_eq!(watch_params.label_selector.as_deref(), Some("app=test"));
+            [
+                Recording::Watch(initial_params, initial_version),
+                Recording::Watch(resumed_params, resumed_version),
+            ] => {
+                assert_eq!(initial_version, "0");
+                assert_eq!(initial_params.label_selector.as_deref(), Some("app=test"));
                 assert_eq!(
-                    watch_params.field_selector.as_deref(),
+                    initial_params.field_selector.as_deref(),
                     Some("metadata.name!=ignored")
                 );
-                assert!(watch_params.send_initial_events);
+                assert!(initial_params.send_initial_events);
+
+                assert_eq!(resumed_version, "9");
+                assert_eq!(resumed_params.label_selector.as_deref(), Some("app=test"));
+                assert_eq!(
+                    resumed_params.field_selector.as_deref(),
+                    Some("metadata.name!=ignored")
+                );
+                assert!(!resumed_params.send_initial_events);
             }
-            _ => panic!("unexpected API call sequence"),
+            _ => panic!("unexpected API call sequence {records:?}"),
         }
     }
 
