@@ -3,14 +3,9 @@ use kube_client::{
     Resource,
     api::{ListParams, ObjectList, TypeMeta, WatchEvent, WatchParams},
 };
+use parking_lot::{Mutex, MutexGuard};
 use serde::de::DeserializeOwned;
-use std::{
-    cell::{Ref, RefCell},
-    collections::VecDeque,
-    fmt::Debug,
-    pin::Pin,
-    task::ready,
-};
+use std::{cell::RefCell, collections::VecDeque, fmt::Debug, pin::Pin, sync::Arc, task::ready};
 
 use crate::watcher::ApiMode;
 
@@ -28,13 +23,18 @@ fn exhausted_watch_sequence() -> kube_client::Error {
 /// This method expects an error, making it a bit less ergonomic on the caller. The alternative was
 /// using [`kube_client::Result`] with [`std::any::Any`] as event type.
 pub fn error_indicates_graceful_watch_seq_exhaustion(err: &crate::watcher::Error) -> bool {
-    matches!(
+    (matches!(
+        err,
+        crate::watcher::Error::WatchStartFailed(kube_client::Error::ReadEvents(err))
+            if err.kind() == std::io::ErrorKind::UnexpectedEof
+    ) || matches!(
         err,
         crate::watcher::Error::WatchFailed(kube_client::Error::ReadEvents(err))
             if err.kind() == std::io::ErrorKind::UnexpectedEof
-    ) && err.to_string().contains(TEST_MODE_SEQUENCE_EXHAUSTED_DESC)
+    )) && err.to_string().contains(TEST_MODE_SEQUENCE_EXHAUSTED_DESC)
 }
 
+#[derive(Debug)]
 pub enum Recording {
     List(ListParams),
     Watch(WatchParams, String),
@@ -42,29 +42,30 @@ pub enum Recording {
 
 /// `TestMode` is the test-only "mock" implementation for [`ApiMode`].
 ///
+#[derive(Clone)]
 pub struct TestMode<K>
 where
-    K: Clone + Debug + DeserializeOwned + Send + Sync + 'static,
+    K: Clone + Debug + DeserializeOwned + Send + 'static,
 {
     /// [`TestMode::list_sequence`] is the fixed list of values `TestMode` returns, removing
     /// one element per call and returning it once none are left.
     /// This enables us to simulate different list scenarios.
     ///
-    list_sequence: RefCell<VecDeque<kube_client::Result<ObjectList<K>>>>,
+    list_sequence: Arc<Mutex<VecDeque<kube_client::Result<ObjectList<K>>>>>,
     /// [`TestMode::watch_sequences`] is the fixed list of [`Sequence`]s `TestMode` returns. It
     /// allows simulating waiting periods and empty intermediary results via [`TestStream`]. Once
     /// exhausted, further watch calls return an unexpected EOF error.
-    watch_sequences: RefCell<VecDeque<Sequence<K>>>,
+    watch_sequences: Arc<Mutex<VecDeque<Sequence<K>>>>,
     /// Any observed request gets tracked here. See [`Recording`] for details.
-    recorder: RefCell<Vec<Recording>>,
+    recorder: Arc<Mutex<Vec<Recording>>>,
 }
 
 impl<K> TestMode<K>
 where
-    K: Clone + Debug + DeserializeOwned + Send + Sync,
+    K: Clone + Debug + DeserializeOwned + Send,
 {
-    pub fn get_recordings(&self) -> Ref<'_, Vec<Recording>> {
-        self.recorder.borrow()
+    pub fn get_recordings(&self) -> MutexGuard<'_, Vec<Recording>> {
+        self.recorder.lock()
     }
 }
 
@@ -77,9 +78,9 @@ where
         watch_sequence: VecDeque<Sequence<K>>,
     ) -> Self {
         Self {
-            list_sequence: RefCell::new(list_sequence),
-            watch_sequences: RefCell::new(watch_sequence),
-            recorder: RefCell::new(vec![]),
+            list_sequence: Arc::new(Mutex::new(list_sequence)),
+            watch_sequences: Arc::new(Mutex::new(watch_sequence)),
+            recorder: Arc::new(Mutex::new(vec![])),
         }
     }
 }
@@ -216,14 +217,14 @@ impl<K: Unpin> futures::Stream for TestStream<K> {
                     }
                 },
                 None => {
-                    return std::task::Poll::Ready(Some(Err(exhausted_watch_sequence())));
+                    //return std::task::Poll::Ready(Some(Err(exhausted_watch_sequence())));
+                    return std::task::Poll::Ready(None);
                 }
             }
         }
     }
 }
 
-#[allow(clippy::unused_async_trait_impl)]
 impl<K> ApiMode for TestMode<K>
 where
     K: Resource<DynamicType = ()> + Clone + Debug + DeserializeOwned + Send + Unpin + 'static,
@@ -231,8 +232,8 @@ where
     type Value = K;
 
     async fn list(&self, lp: &ListParams) -> kube_client::Result<ObjectList<Self::Value>> {
-        self.recorder.borrow_mut().push(Recording::List(lp.clone()));
-        match self.list_sequence.borrow_mut().pop_front() {
+        self.recorder.lock().push(Recording::List(lp.clone()));
+        match self.list_sequence.lock().pop_front() {
             Some(next) => next,
             None => Ok(empty_list()),
         }
@@ -245,9 +246,9 @@ where
     ) -> kube_client::Result<futures::stream::BoxStream<'static, kube_client::Result<WatchEvent<Self::Value>>>>
     {
         self.recorder
-            .borrow_mut()
+            .lock()
             .push(Recording::Watch(wp.clone(), version.into()));
-        let Some(seq) = self.watch_sequences.borrow_mut().pop_front() else {
+        let Some(seq) = self.watch_sequences.lock().pop_front() else {
             return Err(exhausted_watch_sequence());
         };
         Ok(TestStream {

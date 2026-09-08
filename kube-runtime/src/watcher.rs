@@ -22,7 +22,7 @@ use std::{
     clone::Clone,
     collections::VecDeque,
     fmt::{Debug, Display},
-    future,
+    future::{self, Future},
     time::Duration,
 };
 use thiserror::Error;
@@ -174,20 +174,25 @@ enum State<K> {
 /// Used to control whether the watcher receives the full object, or only the
 /// metadata
 trait ApiMode: Send + Sync {
-    type Value: Clone + Send;
+    type Value: Clone + Send + 'static;
 
-    async fn list(&self, lp: &ListParams) -> kube_client::Result<ObjectList<Self::Value>>;
-    async fn watch(
+    fn list(
+        &self,
+        lp: &ListParams,
+    ) -> impl Future<Output = kube_client::Result<ObjectList<Self::Value>>> + Send;
+    fn watch(
         &self,
         wp: &WatchParams,
         version: &str,
-    ) -> kube_client::Result<BoxStream<'static, kube_client::Result<WatchEvent<Self::Value>>>>;
+    ) -> impl Future<
+        Output = kube_client::Result<BoxStream<'static, kube_client::Result<WatchEvent<Self::Value>>>>,
+    > + Send;
 }
 
 /// A wrapper around the `Api` of a `Resource` type that when used by the
 /// watcher will return the entire (full) object
-struct FullObject<'a, K> {
-    api: &'a Api<K>,
+struct FullObject<K> {
+    api: Api<K>,
 }
 
 /// Configurable list semantics for `watcher` relists
@@ -457,7 +462,7 @@ enum WatchPhase {
     Resumed,
 }
 
-impl<K> ApiMode for FullObject<'_, K>
+impl<K> ApiMode for FullObject<K>
 where
     K: Clone + Debug + DeserializeOwned + Send + 'static,
 {
@@ -478,11 +483,11 @@ where
 
 /// A wrapper around the `Api` of a `Resource` type that when used by the
 /// watcher will return only the metadata associated with an object
-struct MetaOnly<'a, K> {
-    api: &'a Api<K>,
+struct MetaOnly<K> {
+    api: Api<K>,
 }
 
-impl<K> ApiMode for MetaOnly<'_, K>
+impl<K> ApiMode for MetaOnly<K>
 where
     K: Clone + Debug + DeserializeOwned + Send + 'static,
 {
@@ -842,31 +847,24 @@ pub fn watcher<K: Resource + Clone + DeserializeOwned + Debug + Send + 'static>(
     api: Api<K>,
     watcher_config: Config,
 ) -> impl Stream<Item = Result<Event<K>>> + Send {
+    watcher_inner(FullObject { api }, watcher_config)
+}
+
+/// [`ApiMode`] compatibility helper. Introduced later so that the core logic of [`watcher`] can be tested without
+/// having to modify its pre-existing signature.
+fn watcher_inner<A>(api: A, watcher_config: Config) -> impl Stream<Item = Result<Event<A::Value>>> + Send
+where
+    A: ApiMode,
+    A::Value: Resource,
+{
     futures::stream::unfold(
         (api, watcher_config, State::default()),
         |(api, watcher_config, state)| async {
-            let (event, state) = step(&FullObject { api: &api }, &watcher_config, state).await;
+            let (event, state) = step(&api, &watcher_config, state).await;
             Some((event, (api, watcher_config, state)))
         },
     )
 }
-
-//pub fn recoverable_watcher<A>(
-//    api: A,
-//    watcher_config: Config,
-//) -> impl Stream<Item = Result<Event<A::Value>>> + Send
-//where
-//    A: ApiMode + Send + Sync,
-//    A::Value: Resource + Clone + DeserializeOwned + Debug + Send + Sync + 'static,
-//{
-//    futures::stream::unfold(
-//        (api, watcher_config, State::default()),
-//        |(api, watcher_config, state)| async {
-//            let (event, state) = step(&api, &watcher_config, state).await;
-//            Some((event, (api, watcher_config, state)))
-//        },
-//    )
-//}
 
 /// Watches a Kubernetes Resource for changes continuously and receives only the
 /// metadata
@@ -927,13 +925,7 @@ pub fn metadata_watcher<K: Resource + Clone + DeserializeOwned + Debug + Send + 
     api: Api<K>,
     watcher_config: Config,
 ) -> impl Stream<Item = Result<Event<PartialObjectMeta<K>>>> + Send {
-    futures::stream::unfold(
-        (api, watcher_config, State::default()),
-        |(api, watcher_config, state)| async {
-            let (event, state) = step(&MetaOnly { api: &api }, &watcher_config, state).await;
-            Some((event, (api, watcher_config, state)))
-        },
-    )
+    watcher_inner(MetaOnly { api }, watcher_config)
 }
 
 /// Watch a single named object for updates
@@ -1080,14 +1072,18 @@ mod tests {
     use k8s_openapi::{api::core::v1::ConfigMap, apimachinery::pkg::apis::meta::v1::ObjectMeta};
     use kube_client::{
         api::{TypeMeta, WatchEvent, WatchParams},
-        core::watch::{Bookmark, BookmarkMeta},
+        core::{
+            Status,
+            watch::{Bookmark, BookmarkMeta},
+        },
     };
 
     use crate::watcher::{
-        self, ApiMode, Config, Error, ExponentialBackoff, State, WatchPhase, next_with_idle_timeout, step,
+        ApiMode, Config, ExponentialBackoff, State, WatchPhase, next_with_idle_timeout, step,
         stub_watcher::{
             Recording, Sequence, SequenceStep, TestMode, error_indicates_graceful_watch_seq_exhaustion,
         },
+        watcher_inner,
     };
 
     use super::stub_watcher::ResultPage;
@@ -1131,31 +1127,77 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_list_resync() {
-        // The purpose of this test specifically is to test the recovery behaviour of
-        // step/step_trampolined, i.e., it should continue producing/processing results even after
-        // the underlying ApiMode returns a temporary/recoverable error.
-        // TODO(juf): Consider/think about: calling watcher(...) instead to include it in the code/test-coverage
-        // as well.
-
         const LAST_VALID_RESOURCE_VERSION: &str = "5";
+        let mut recoverable_err = Box::new(Status::default());
+        // This does not trigger re-issuing a watch request: recoverable_err.code = 502;
+        recoverable_err.code = 502;
+        //recoverable_err.code = 410;
+        recoverable_err.message = "some err".to_string();
+        recoverable_err.reason = "Something went wrong".to_string();
         let api = TestMode::new(
             vec![].into(),
-            vec![Sequence::new(
-                vec![
-                    SequenceStep::List(
+            vec![
+                Sequence::new(
+                    vec![
+                        SequenceStep::List(
+                            vec![
+                                Ok(WatchEvent::Added(config_map("a", "2"))),
+                                Ok(WatchEvent::Added(config_map("b", "3"))),
+                                Ok(WatchEvent::Added(config_map("c", "4"))),
+                                // Details here: https://kubernetes.io/docs/reference/using-api/api-concepts/#streaming-lists
+                                // Should only be sent when requested via allowWatchBookmarks=true
+                                // Since TestMode does not contain any real logic and  is not dynamically
+                                // progammable, this is up to the test
+                                // author to return or not for now.
+                                Ok(WatchEvent::Bookmark(Bookmark {
+                                    types: TypeMeta::resource::<ConfigMap>(),
+                                    metadata: BookmarkMeta {
+                                        resource_version: "4".to_string(),
+                                        annotations: BTreeMap::from_iter(vec![(
+                                            "k8s.io/initial-events-end".into(),
+                                            "true".into(),
+                                        )]),
+                                    },
+                                })),
+                            ]
+                            .into(),
+                        ),
+                        SequenceStep::List(
+                            vec![
+                                Ok(WatchEvent::Modified(config_map("a", LAST_VALID_RESOURCE_VERSION))),
+                                Ok(WatchEvent::Error(recoverable_err)),
+                                // Error below is does not trigger "recovery" in the sense of
+                                // calling `watch` again on the underlying API
+                                //
+                                //Err(kube_client::Error::ReadEvents(std::io::Error::new(
+                                //    std::io::ErrorKind::UnexpectedEof,
+                                //    "A recoverable error occured",
+                                //))),
+                            ]
+                            .into(),
+                        ),
+                        // After an error we expect the watcher to request its last(latest) known
+                        // resource version to be queried again.
+                        SequenceStep::List(
+                            vec![Ok(WatchEvent::Modified(config_map(
+                                "a",
+                                LAST_VALID_RESOURCE_VERSION,
+                            )))]
+                            .into(),
+                        ),
+                    ]
+                    .into(),
+                ),
+                // After an error we expect the watcher to request its last(latest) known
+                // resource version to be queried again.
+                Sequence::new(
+                    vec![SequenceStep::List(
                         vec![
-                            Ok(WatchEvent::Added(config_map("a", "2"))),
-                            Ok(WatchEvent::Added(config_map("b", "3"))),
-                            Ok(WatchEvent::Added(config_map("c", "4"))),
-                            // Details here: https://kubernetes.io/docs/reference/using-api/api-concepts/#streaming-lists
-                            // Should only be sent when requested via allowWatchBookmarks=true
-                            // Since TestMode does not contain any real logic and  is not dynamically
-                            // progammable, this is up to the test
-                            // author to return or not for now.
+                            Ok(WatchEvent::Added(config_map("a", "5"))),
                             Ok(WatchEvent::Bookmark(Bookmark {
                                 types: TypeMeta::resource::<ConfigMap>(),
                                 metadata: BookmarkMeta {
-                                    resource_version: "4".to_string(),
+                                    resource_version: "5".to_string(),
                                     annotations: BTreeMap::from_iter(vec![(
                                         "k8s.io/initial-events-end".into(),
                                         "true".into(),
@@ -1164,29 +1206,10 @@ mod tests {
                             })),
                         ]
                         .into(),
-                    ),
-                    SequenceStep::List(
-                        vec![
-                            Ok(WatchEvent::Modified(config_map("a", LAST_VALID_RESOURCE_VERSION))),
-                            Err(kube_client::Error::ReadEvents(std::io::Error::new(
-                                std::io::ErrorKind::UnexpectedEof,
-                                "A recoverable error occured",
-                            ))),
-                        ]
-                        .into(),
-                    ),
-                    // After an error we expect the watcher to request its last(latest) known
-                    // resource version to be queried again.
-                    SequenceStep::List(
-                        vec![Ok(WatchEvent::Modified(config_map(
-                            "a",
-                            LAST_VALID_RESOURCE_VERSION,
-                        )))]
-                        .into(),
-                    ),
-                ]
-                .into(),
-            )]
+                    )]
+                    .into(),
+                ),
+            ]
             .into(),
         );
 
@@ -1195,44 +1218,38 @@ mod tests {
             .streaming_lists()
             .labels("app=test")
             .fields("metadata.name!=ignored");
-        //let test_watcher = super::watcher(api, config);
-        let mut state = State::default();
+        let mut stream = std::pin::pin!(watcher_inner(api.clone(), config));
+
         for expected in [
             "InitApply(a)",
             "InitApply(b)",
             "InitApply(c)",
             "InitDone",
             "Apply(a)",
-            "watch stream failed: Error reading events stream: A recoverable error occured",
+            //"watch stream failed: Error reading events stream: A recoverable error occured",
+            "error returned by apiserver during watch: some err: Something went wrong",
+            //"InitApply(a)",
             "Apply(a)",
+            "Apply(a)",
+            //"InitDone",
         ] {
-            println!("-----");
-            dbg!(&state);
-            println!(">>>");
-            let (event, next) = step(&api, &config, state).await;
-            state = next;
+            let event = stream.next().await.expect("watcher stream should not end");
             let repr = match event {
-                Ok(event) => {
-                    println!("Ok()");
-                    event.to_string()
-                }
-                Err(err) => {
-                    println!("Err()");
-                    err.to_string()
-                }
+                Ok(event) => event.to_string(),
+                Err(err) => err.to_string(),
             };
-            dbg!(&state);
-            println!("-----");
             assert_eq!(repr, expected);
         }
 
-        let (event, _) = tokio::time::timeout(Duration::from_millis(100), step(&api, &config, state))
+        let event = tokio::time::timeout(Duration::from_millis(100), stream.next())
             .await
-            .expect("step should return when the TestMode sequence is exhausted");
+            .expect("watcher should return when the TestMode sequence is exhausted")
+            .expect("watcher stream should not end");
         // See function docs for more context, we expect this error, when we want to check whether
         // the whole watch sequence has been consumed and as breaker to avoid consuming an infinite
         // async stream that returns None.
-        assert!(event.is_err_and(|err| error_indicates_graceful_watch_seq_exhaustion(&err)));
+        dbg!(&event);
+        assert!(event.is_err_and(|err| error_indicates_graceful_watch_seq_exhaustion(&err)),);
 
         let records = api.get_recordings();
         match &records[..] {
@@ -1245,7 +1262,7 @@ mod tests {
                 );
                 assert!(watch_params.send_initial_events);
             }
-            _ => panic!("unexpected API call sequence"),
+            _ => panic!("unexpected API call sequence {records:?}"),
         }
     }
 
