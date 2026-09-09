@@ -219,7 +219,6 @@ impl<K: Unpin> futures::Stream for TestStream<K> {
                     }
                 },
                 None => {
-                    //return std::task::Poll::Ready(Some(Err(exhausted_watch_sequence())));
                     return std::task::Poll::Ready(None);
                 }
             }

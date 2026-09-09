@@ -1102,9 +1102,7 @@ mod tests {
     async fn streaming_list_resync() {
         const LAST_VALID_RESOURCE_VERSION: &str = "5";
         let mut recoverable_err = Box::new(Status::default());
-        // This does not trigger re-issuing a watch request: recoverable_err.code = 502;
         recoverable_err.code = 502;
-        //recoverable_err.code = 410;
         recoverable_err.message = "some err".to_string();
         recoverable_err.reason = "Something went wrong".to_string();
         let api = TestMode::new(
@@ -1139,13 +1137,6 @@ mod tests {
                             vec![
                                 Ok(WatchEvent::Modified(config_map("a", LAST_VALID_RESOURCE_VERSION))),
                                 Ok(WatchEvent::Error(recoverable_err)),
-                                // Error below is does not trigger "recovery" in the sense of
-                                // calling `watch` again on the underlying API
-                                //
-                                //Err(kube_client::Error::ReadEvents(std::io::Error::new(
-                                //    std::io::ErrorKind::UnexpectedEof,
-                                //    "A recoverable error occured",
-                                //))),
                             ]
                             .into(),
                         ),
@@ -1191,6 +1182,8 @@ mod tests {
             .streaming_lists()
             .labels("app=test")
             .fields("metadata.name!=ignored");
+        // NOTE(juf): The stream which is returned here is not the same stream that an individual `watch` result produces.
+        // That stream is wrapped and hidden behind the inner state [`kube_runtime::watcher::State`] of the watcher implementation.
         let mut stream = std::pin::pin!(watcher_inner(api.clone(), config));
 
         for expected in [
@@ -1199,12 +1192,9 @@ mod tests {
             "InitApply(c)",
             "InitDone",
             "Apply(a)",
-            //"watch stream failed: Error reading events stream: A recoverable error occured",
             "error returned by apiserver during watch: some err: Something went wrong",
-            //"InitApply(a)",
             "Apply(a)",
             "Apply(a)",
-            //"InitDone",
         ] {
             let event = stream.next().await.expect("watcher stream should not end");
             let repr = match event {
