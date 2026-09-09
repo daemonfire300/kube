@@ -5,7 +5,9 @@ use kube_client::{
 };
 use parking_lot::{Mutex, MutexGuard};
 use serde::de::DeserializeOwned;
-use std::{cell::RefCell, collections::VecDeque, fmt::Debug, pin::Pin, sync::Arc, task::ready};
+use std::{
+    cell::RefCell, collections::VecDeque, fmt::Debug, future::Future, pin::Pin, sync::Arc, task::ready,
+};
 
 use crate::watcher::ApiMode;
 
@@ -231,31 +233,37 @@ where
 {
     type Value = K;
 
-    async fn list(&self, lp: &ListParams) -> kube_client::Result<ObjectList<Self::Value>> {
+    fn list(
+        &self,
+        lp: &ListParams,
+    ) -> impl Future<Output = kube_client::Result<ObjectList<Self::Value>>> + Send {
         self.recorder.lock().push(Recording::List(lp.clone()));
-        match self.list_sequence.lock().pop_front() {
+        std::future::ready(match self.list_sequence.lock().pop_front() {
             Some(next) => next,
             None => Ok(empty_list()),
-        }
+        })
     }
 
-    async fn watch(
+    fn watch(
         &self,
         wp: &WatchParams,
         version: &str,
-    ) -> kube_client::Result<futures::stream::BoxStream<'static, kube_client::Result<WatchEvent<Self::Value>>>>
-    {
+    ) -> impl Future<
+        Output = kube_client::Result<
+            futures::stream::BoxStream<'static, kube_client::Result<WatchEvent<Self::Value>>>,
+        >,
+    > + Send {
         self.recorder
             .lock()
             .push(Recording::Watch(wp.clone(), version.into()));
         let Some(seq) = self.watch_sequences.lock().pop_front() else {
-            return Err(exhausted_watch_sequence());
+            return std::future::ready(Err(exhausted_watch_sequence()));
         };
-        Ok(TestStream {
+        std::future::ready(Ok(TestStream {
             seq: RefCell::new(seq),
             waiting: None,
         }
         .fuse()
-        .boxed())
+        .boxed()))
     }
 }
