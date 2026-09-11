@@ -76,12 +76,12 @@ where
     K: Clone + Debug + DeserializeOwned + Send,
 {
     pub fn new(
-        list_sequence: VecDeque<kube_client::Result<ObjectList<K>>>,
-        watch_sequence: VecDeque<Sequence<K>>,
+        list_sequence: Vec<kube_client::Result<ObjectList<K>>>,
+        watch_sequence: Vec<Sequence<K>>,
     ) -> Self {
         Self {
-            list_sequence: Arc::new(Mutex::new(list_sequence)),
-            watch_sequences: Arc::new(Mutex::new(watch_sequence)),
+            list_sequence: Arc::new(Mutex::new(list_sequence.into())),
+            watch_sequences: Arc::new(Mutex::new(watch_sequence.into())),
             recorder: Arc::new(Mutex::new(vec![])),
         }
     }
@@ -153,8 +153,8 @@ pub struct Sequence<K> {
 }
 
 impl<K> Sequence<K> {
-    pub fn new(steps: VecDeque<SequenceStep<K>>) -> Self {
-        Self { inner: steps }
+    pub fn new(steps: Vec<SequenceStep<K>>) -> Self {
+        Self { inner: steps.into() }
     }
 }
 

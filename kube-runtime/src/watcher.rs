@@ -1073,17 +1073,10 @@ mod tests {
 
     #[tokio::test(start_paused = true)]
     async fn test_mode_watch_waits_before_returning_next_event() {
-        let api = TestMode::new(
-            vec![].into(),
-            vec![Sequence::new(
-                vec![
-                    SequenceStep::Wait(Duration::from_millis(50)),
-                    SequenceStep::List(vec![Ok(WatchEvent::Added(config_map("a", "1")))].into()),
-                ]
-                .into(),
-            )]
-            .into(),
-        );
+        let api = TestMode::new(vec![], vec![Sequence::new(vec![
+            SequenceStep::Wait(Duration::from_millis(50)),
+            SequenceStep::List(vec![Ok(WatchEvent::Added(config_map("a", "1")))].into()),
+        ])]);
         let mut stream = api.watch(&WatchParams::default(), "0").await.unwrap();
 
         assert!(futures::poll!(stream.next()).is_pending());
@@ -1105,77 +1098,67 @@ mod tests {
         recoverable_err.code = 502;
         recoverable_err.message = "some err".to_string();
         recoverable_err.reason = "Something went wrong".to_string();
-        let api = TestMode::new(
-            vec![].into(),
-            vec![
-                Sequence::new(
+        let api = TestMode::new(vec![], vec![
+            Sequence::new(vec![
+                SequenceStep::List(
                     vec![
-                        SequenceStep::List(
-                            vec![
-                                Ok(WatchEvent::Added(config_map("a", "2"))),
-                                Ok(WatchEvent::Added(config_map("b", "3"))),
-                                Ok(WatchEvent::Added(config_map("c", "4"))),
-                                // Details here: https://kubernetes.io/docs/reference/using-api/api-concepts/#streaming-lists
-                                // Should only be sent when requested via allowWatchBookmarks=true
-                                // Since TestMode does not contain any real logic and  is not dynamically
-                                // progammable, this is up to the test
-                                // author to return or not for now.
-                                Ok(WatchEvent::Bookmark(Bookmark {
-                                    types: TypeMeta::resource::<ConfigMap>(),
-                                    metadata: BookmarkMeta {
-                                        resource_version: "4".to_string(),
-                                        annotations: BTreeMap::from_iter(vec![(
-                                            "k8s.io/initial-events-end".into(),
-                                            "true".into(),
-                                        )]),
-                                    },
-                                })),
-                            ]
-                            .into(),
-                        ),
-                        SequenceStep::List(
-                            vec![
-                                Ok(WatchEvent::Modified(config_map("a", LAST_VALID_RESOURCE_VERSION))),
-                                Ok(WatchEvent::Error(recoverable_err)),
-                            ]
-                            .into(),
-                        ),
-                        // After an error we expect the watcher to request its last(latest) known
-                        // resource version to be queried again.
-                        SequenceStep::List(
-                            vec![Ok(WatchEvent::Modified(config_map(
-                                "a",
-                                LAST_VALID_RESOURCE_VERSION,
-                            )))]
-                            .into(),
-                        ),
+                        Ok(WatchEvent::Added(config_map("a", "2"))),
+                        Ok(WatchEvent::Added(config_map("b", "3"))),
+                        Ok(WatchEvent::Added(config_map("c", "4"))),
+                        // Details here: https://kubernetes.io/docs/reference/using-api/api-concepts/#streaming-lists
+                        // Should only be sent when requested via allowWatchBookmarks=true
+                        // Since TestMode does not contain any real logic and  is not dynamically
+                        // progammable, this is up to the test
+                        // author to return or not for now.
+                        Ok(WatchEvent::Bookmark(Bookmark {
+                            types: TypeMeta::resource::<ConfigMap>(),
+                            metadata: BookmarkMeta {
+                                resource_version: "4".to_string(),
+                                annotations: BTreeMap::from_iter(vec![(
+                                    "k8s.io/initial-events-end".into(),
+                                    "true".into(),
+                                )]),
+                            },
+                        })),
+                    ]
+                    .into(),
+                ),
+                SequenceStep::List(
+                    vec![
+                        Ok(WatchEvent::Modified(config_map("a", LAST_VALID_RESOURCE_VERSION))),
+                        Ok(WatchEvent::Error(recoverable_err)),
                     ]
                     .into(),
                 ),
                 // After an error we expect the watcher to request its last(latest) known
                 // resource version to be queried again.
-                Sequence::new(
-                    vec![SequenceStep::List(
-                        vec![
-                            Ok(WatchEvent::Added(config_map("a", "5"))),
-                            Ok(WatchEvent::Bookmark(Bookmark {
-                                types: TypeMeta::resource::<ConfigMap>(),
-                                metadata: BookmarkMeta {
-                                    resource_version: "5".to_string(),
-                                    annotations: BTreeMap::from_iter(vec![(
-                                        "k8s.io/initial-events-end".into(),
-                                        "true".into(),
-                                    )]),
-                                },
-                            })),
-                        ]
-                        .into(),
-                    )]
+                SequenceStep::List(
+                    vec![Ok(WatchEvent::Modified(config_map(
+                        "a",
+                        LAST_VALID_RESOURCE_VERSION,
+                    )))]
                     .into(),
                 ),
-            ]
-            .into(),
-        );
+            ]),
+            // After an error we expect the watcher to request its last(latest) known
+            // resource version to be queried again.
+            Sequence::new(vec![SequenceStep::List(
+                vec![
+                    Ok(WatchEvent::Added(config_map("a", "5"))),
+                    Ok(WatchEvent::Bookmark(Bookmark {
+                        types: TypeMeta::resource::<ConfigMap>(),
+                        metadata: BookmarkMeta {
+                            resource_version: "5".to_string(),
+                            annotations: BTreeMap::from_iter(vec![(
+                                "k8s.io/initial-events-end".into(),
+                                "true".into(),
+                            )]),
+                        },
+                    })),
+                ]
+                .into(),
+            )]),
+        ]);
 
         let config = Config::default()
             .timeout(1)
@@ -1248,46 +1231,39 @@ mod tests {
 
     #[tokio::test]
     async fn streaming_list_init() {
-        let api = TestMode::new(
-            vec![].into(),
-            vec![Sequence::new(
+        let api = TestMode::new(vec![], vec![Sequence::new(vec![
+            SequenceStep::List(
                 vec![
-                    SequenceStep::List(
-                        vec![
-                            Ok(WatchEvent::Added(config_map("a", "2"))),
-                            Ok(WatchEvent::Added(config_map("b", "3"))),
-                            Ok(WatchEvent::Added(config_map("c", "4"))),
-                            // Details here: https://kubernetes.io/docs/reference/using-api/api-concepts/#streaming-lists
-                            // Should only be sent when requested via allowWatchBookmarks=true
-                            // Since TestMode does not contain any real logic and  is not dynamically
-                            // progammable, this is up to the test
-                            // author to return or not for now.
-                            Ok(WatchEvent::Bookmark(Bookmark {
-                                types: TypeMeta::resource::<ConfigMap>(),
-                                metadata: BookmarkMeta {
-                                    resource_version: "145".to_string(),
-                                    annotations: BTreeMap::from_iter(vec![(
-                                        "k8s.io/initial-events-end".into(),
-                                        "true".into(),
-                                    )]),
-                                },
-                            })),
-                        ]
-                        .into(),
-                    ),
-                    SequenceStep::List(
-                        vec![
-                            Ok(WatchEvent::Modified(config_map("a", "5"))),
-                            Ok(WatchEvent::Deleted(config_map("b", "7"))),
-                            Ok(WatchEvent::Modified(config_map("c", "9"))),
-                        ]
-                        .into(),
-                    ),
+                    Ok(WatchEvent::Added(config_map("a", "2"))),
+                    Ok(WatchEvent::Added(config_map("b", "3"))),
+                    Ok(WatchEvent::Added(config_map("c", "4"))),
+                    // Details here: https://kubernetes.io/docs/reference/using-api/api-concepts/#streaming-lists
+                    // Should only be sent when requested via allowWatchBookmarks=true
+                    // Since TestMode does not contain any real logic and  is not dynamically
+                    // progammable, this is up to the test
+                    // author to return or not for now.
+                    Ok(WatchEvent::Bookmark(Bookmark {
+                        types: TypeMeta::resource::<ConfigMap>(),
+                        metadata: BookmarkMeta {
+                            resource_version: "145".to_string(),
+                            annotations: BTreeMap::from_iter(vec![(
+                                "k8s.io/initial-events-end".into(),
+                                "true".into(),
+                            )]),
+                        },
+                    })),
                 ]
                 .into(),
-            )]
-            .into(),
-        );
+            ),
+            SequenceStep::List(
+                vec![
+                    Ok(WatchEvent::Modified(config_map("a", "5"))),
+                    Ok(WatchEvent::Deleted(config_map("b", "7"))),
+                    Ok(WatchEvent::Modified(config_map("c", "9"))),
+                ]
+                .into(),
+            ),
+        ])]);
 
         let config = Config::default()
             .timeout(1)
@@ -1360,15 +1336,10 @@ mod tests {
                     .items(vec![config_map("c", "3")])
                     .resource_version("3".into())
                     .into()),
-            ]
-            .into(),
-            vec![Sequence::new(
-                vec![SequenceStep::List(
-                    vec![Ok(WatchEvent::Added(config_map("d", "4")))].into(),
-                )]
-                .into(),
-            )]
-            .into(),
+            ],
+            vec![Sequence::new(vec![SequenceStep::List(
+                vec![Ok(WatchEvent::Added(config_map("d", "4")))].into(),
+            )])],
         );
 
         let config = Config::default()
