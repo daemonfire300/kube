@@ -640,7 +640,6 @@ impl<T: Serialize> Patch<T> {
         match &self {
             Self::Apply(_) => "application/apply-patch+yaml",
             #[cfg(feature = "jsonpatch")]
-            #[cfg_attr(docsrs, doc(cfg(feature = "jsonpatch")))]
             Self::Json(_) => "application/json-patch+json",
             Self::Merge(_) => "application/merge-patch+json",
             Self::Strategic(_) => "application/strategic-merge-patch+json",
@@ -653,7 +652,6 @@ impl<T: Serialize> Patch<T> {
         match self {
             Self::Apply(p) => serde_json::to_vec(p),
             #[cfg(feature = "jsonpatch")]
-            #[cfg_attr(docsrs, doc(cfg(feature = "jsonpatch")))]
             Self::Json(p) => serde_json::to_vec(p),
             Self::Strategic(p) => serde_json::to_vec(p),
             Self::Merge(p) => serde_json::to_vec(p),
