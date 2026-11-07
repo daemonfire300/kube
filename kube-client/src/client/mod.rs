@@ -90,7 +90,7 @@ pub struct Client {
     valid_until: Option<Timestamp>,
     // Per-clone policy, set by Api::without_managed_fields. Only typed JSON
     // requests apply it; raw requests and streams retain their representations.
-    pub(crate) managed_fields: bool,
+    pub(crate) managed_fields: Option<crate::api::ManagedFieldsPolicy>,
 }
 
 /// Represents a WebSocket connection.
@@ -169,7 +169,7 @@ impl Client {
             inner: Buffer::new(service, 1024),
             default_ns: default_namespace.into(),
             valid_until: None,
-            managed_fields: false,
+            managed_fields: None,
         }
     }
 
@@ -287,10 +287,10 @@ impl Client {
     where
         T: DeserializeOwned,
     {
-        managed_fields::prepare(&mut request, self.managed_fields);
+        let policy = managed_fields::prepare(&mut request, self.managed_fields);
         let text = self.request_text(request).await?;
 
-        serde_json::from_str(&text).map_err(|e| {
+        managed_fields::decode(&text, policy, false).map_err(|e| {
             tracing::warn!("{}, {:?}", text, e);
             Error::SerdeError(e)
         })
@@ -329,7 +329,7 @@ impl Client {
     where
         T: DeserializeOwned,
     {
-        managed_fields::prepare(&mut request, self.managed_fields);
+        let policy = managed_fields::prepare(&mut request, self.managed_fields);
         let text = self.request_text(request).await?;
         // It needs to be JSON:
         let v: Value = serde_json::from_str(&text).map_err(Error::SerdeError)?;
@@ -340,10 +340,12 @@ impl Client {
                 Error::SerdeError(e)
             })?))
         } else {
-            Ok(Left(serde_json::from_str::<T>(&text).map_err(|e| {
-                tracing::warn!("{}, {:?}", text, e);
-                Error::SerdeError(e)
-            })?))
+            Ok(Left(managed_fields::decode::<T>(&text, policy, false).map_err(
+                |e| {
+                    tracing::warn!("{}, {:?}", text, e);
+                    Error::SerdeError(e)
+                },
+            )?))
         }
     }
 
@@ -363,7 +365,7 @@ impl Client {
             .headers_mut()
             .entry(http::header::ACCEPT_ENCODING)
             .or_insert(http::HeaderValue::from_static("identity"));
-        managed_fields::prepare(&mut request, self.managed_fields);
+        let policy = managed_fields::prepare(&mut request, self.managed_fields);
         let res = self.send(request.map(Body::from)).await?;
         let res = handle_api_errors(res).await?;
         // trace!("Streaming from {} -> {}", res.url(), res.status().as_str());
@@ -374,9 +376,9 @@ impl Client {
             LinesCodec::new(),
         );
 
-        Ok(frames.filter_map(|res| async {
+        Ok(frames.filter_map(move |res| async move {
             match res {
-                Ok(line) => match serde_json::from_str::<WatchEvent<T>>(&line) {
+                Ok(line) => match managed_fields::decode::<WatchEvent<T>>(&line, policy, true) {
                     Ok(event) => Some(Ok(event)),
                     Err(e) => {
                         // Ignore EOF error that can happen for incomplete line from `decode_eof`.

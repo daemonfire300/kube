@@ -44,6 +44,18 @@ pub use params::{
 
 use crate::Client;
 
+/// Policy allows the user to opt-in to either pure server-side drop `metadata.managedFields` or to
+/// use the client-side fallback in addition to it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ManagedFieldsPolicy {
+    /// Request server-side omission only (KEP-5958).
+    ///
+    /// Servers without support may still return managed fields.
+    ServerOnly,
+    /// Request server-side omission and strip any remaining fields during deserialization.
+    ClientFallback,
+}
+
 /// The generic Api abstraction
 ///
 /// This abstracts over a [`Request`] and a type `K` so that
@@ -384,7 +396,9 @@ impl<K> From<Api<K>> for Client {
 impl<K> Api<K> {
     /// Omit `metadata.managedFields` from resource responses (KEP-5958).
     ///
-    /// Requests server-side omission. Servers without support may still return managed fields.
+    /// Both policies request server-side omission. [`ManagedFieldsPolicy::ClientFallback`]
+    /// also skips remaining managed fields during deserialization on older servers.
+    /// Use [`ManagedFieldsPolicy::ServerOnly`] to disable that fallback.
     /// Applies to lists, watches, write responses, and resource subresources;
     /// request bodies are unchanged. Clones and watchers inherit this policy.
     /// Converting this API into a [`Client`] also retains the policy for typed JSON requests.
@@ -392,19 +406,19 @@ impl<K> Api<K> {
     ///
     /// ```no_run
     /// use k8s_openapi::api::core::v1::Pod;
-    /// use kube::{Api, Client, api::ListParams};
+    /// use kube::{Api, Client, api::{ListParams, ManagedFieldsPolicy}};
     ///
     /// # async fn example() -> Result<(), kube::Error> {
     /// let pods: Api<Pod> = Api::all(Client::try_default().await?)
-    ///     .without_managed_fields();
+    ///     .without_managed_fields(ManagedFieldsPolicy::ClientFallback);
     /// let list = pods.list(&ListParams::default()).await?;
-    /// // Servers supporting KEP-5958 omit managed fields from the returned objects.
+    /// assert!(list.items.iter().all(|pod| pod.metadata.managed_fields.is_none()));
     /// # Ok(())
     /// # }
     /// ```
     #[must_use]
-    pub fn without_managed_fields(mut self) -> Self {
-        self.client.managed_fields = true;
+    pub fn without_managed_fields(mut self, policy: ManagedFieldsPolicy) -> Self {
+        self.client.managed_fields = Some(policy);
         self
     }
 }
